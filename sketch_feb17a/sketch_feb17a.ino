@@ -24,7 +24,12 @@ FirebaseConfig config;
 #define LED_UP    D1
 #define LED_DOWN  D2
 #define LED_STOP  D8
+#define FADE_LED  D0  
 const int wifiLed = LED_BUILTIN;
+
+//================= ADJUSTABLE SPEED ARGUMENTS =================//
+int motorStepInterval = 150;  
+int buttonRepeatDelay = 150;  
 
 //================= SETTINGS =================//
 int heightValue = 70;
@@ -32,9 +37,20 @@ int targetHeight = 70;
 int lastFirebaseTarget = 70; 
 const int maxHeight = 120;
 const int minHeight = 60;
-String currentCommand = "STOP";
 
-//================= FUNCTIONS =================//
+String currentLedStatus = "ACTIVE"; 
+String lastLedStatus = ""; 
+
+bool needFirebaseSync = false;
+unsigned long lastSyncTime = 0;
+unsigned long lastMoveTime = 0; 
+unsigned long lastMotorStepTime = 0;
+
+//================= LED LOGIC VARIABLES =================//
+unsigned long lastBlinkToggle = 0;
+bool blinkState = false;
+
+//================= MOTOR FUNCTIONS =================//
 
 void updateMotorLEDs(String state) {
   digitalWrite(LED_UP, state == "UP");
@@ -48,112 +64,147 @@ void stopMotor() {
   updateMotorLEDs("STOP");
 }
 
-void updateHeightFirebase() {
-  if (Firebase.ready()) {
-    Firebase.RTDB.setInt(&fbdo, "/tableControl/height", heightValue);
-  }
-}
-
-// Syncs the new targetHeight to Firebase so the Web Dashboard stays updated
-void updateTargetInFirebase() {
-  if (Firebase.ready()) {
-    Firebase.RTDB.setInt(&fbdo, "/tableControl/targetHeight", targetHeight);
-    lastFirebaseTarget = targetHeight; // Update local tracker so readFirebase doesn't treat it as a new web update
-  }
-}
-
 void moveTowardsTarget() {
   if (heightValue == targetHeight) {
     stopMotor();
     return;
   }
 
-  if (heightValue < targetHeight && heightValue < maxHeight) {
-    digitalWrite(IN1, HIGH);
-    digitalWrite(IN2, LOW);
-    heightValue++;
-    updateHeightFirebase();
-    updateMotorLEDs("UP");
-    Serial.printf("Target: %d | Current: %d (UP)\n", targetHeight, heightValue);
+  if (millis() - lastMotorStepTime > (unsigned long)motorStepInterval) { 
+    if (heightValue < targetHeight && heightValue < maxHeight) {
+      digitalWrite(IN1, HIGH);
+      digitalWrite(IN2, LOW);
+      heightValue++;
+      updateMotorLEDs("UP");
+    } 
+    else if (heightValue > targetHeight && heightValue > minHeight) {
+      digitalWrite(IN1, LOW);
+      digitalWrite(IN2, HIGH);
+      heightValue--;
+      updateMotorLEDs("DOWN");
+    }
+    lastMotorStepTime = millis();
+  }
+}
+
+//================= ATMOSPHERE LED LOGIC =================//
+
+void updateAtmosphereLED() {
+  unsigned long now = millis();
+  bool isMovingManual = (digitalRead(BTN_UP) == LOW || digitalRead(BTN_DOWN) == LOW);
+  bool isMovingAuto = (heightValue != targetHeight);
+
+  if (isMovingManual || isMovingAuto) {
+    lastMoveTime = now; 
+    currentLedStatus = "ACTIVE";
+    if (now - lastBlinkToggle > 300) { 
+      blinkState = !blinkState;
+      analogWrite(FADE_LED, blinkState ? 255 : 0);
+      lastBlinkToggle = now;
+    }
   } 
-  else if (heightValue > targetHeight && heightValue > minHeight) {
-    digitalWrite(IN1, LOW);
-    digitalWrite(IN2, HIGH);
-    heightValue--;
-    updateHeightFirebase();
-    updateMotorLEDs("DOWN");
-    Serial.printf("Target: %d | Current: %d (DOWN)\n", targetHeight, heightValue);
+  else if (now - lastMoveTime < 20000) {
+    currentLedStatus = "ACTIVE";
+    analogWrite(FADE_LED, 255); 
+  } 
+  else {
+    // START DIMMING
+    currentLedStatus = "DIMING STARTED"; 
+    float phase = (now - lastMoveTime - 20000) / 2000.0; 
+    int brightness = (int)(127.5 * (1.0 + sin(PI * phase - (PI / 2.0))));
+    analogWrite(FADE_LED, brightness);
+  }
+
+  // Update Firebase string path only when status changes
+  if (currentLedStatus != lastLedStatus) {
+    if (Firebase.ready()) {
+      Firebase.RTDB.setString(&fbdo, "/tableControl/ledStatus", currentLedStatus);
+      lastLedStatus = currentLedStatus;
+    }
+  }
+}
+
+//================= FIREBASE SYNC FUNCTIONS =================//
+
+void updateHeightFirebase() {
+  static unsigned long lastHeightUpdate = 0;
+  if (Firebase.ready() && millis() - lastHeightUpdate > 2000) { 
+    Firebase.RTDB.setInt(&fbdo, "/tableControl/height", heightValue);
+    lastHeightUpdate = millis();
   }
 }
 
 void readFirebase() {
-  if (!Firebase.ready()) return;
-
-  // 1. Check for Target Height Change from Dashboard
+  if (!Firebase.ready() || needFirebaseSync) return;
   if (Firebase.RTDB.getInt(&fbdo, "/tableControl/targetHeight")) {
     int fbTarget = fbdo.intData();
     if (fbTarget != lastFirebaseTarget) {
       targetHeight = fbTarget;
       lastFirebaseTarget = fbTarget;
-      Serial.printf("Web Update -> New Target: %d\n", targetHeight);
-    }
-  }
-
-  // 2. Check for Manual Commands (STOP still works as an emergency override)
-  if (Firebase.RTDB.getString(&fbdo, "/tableControl/command")) {
-    currentCommand = fbdo.stringData();
-    if (currentCommand == "STOP") {
-      targetHeight = heightValue;
-      updateTargetInFirebase();
-      Firebase.RTDB.setString(&fbdo, "/tableControl/command", "AUTO"); 
     }
   }
 }
 
+void syncToFirebase() {
+  if (needFirebaseSync && (millis() - lastSyncTime > 1000)) {
+    if (Firebase.ready()) {
+      Firebase.RTDB.setInt(&fbdo, "/tableControl/targetHeight", targetHeight);
+      lastFirebaseTarget = targetHeight;
+      needFirebaseSync = false;
+    }
+  }
+}
+
+//================= BUTTON HANDLING =================//
+
 void handleButtons() {
-  // UP Button: Increment Target by 1
+  bool anyPressed = false;
+
   if (digitalRead(BTN_UP) == LOW) {
     if (targetHeight < maxHeight) {
       targetHeight++;
-      updateTargetInFirebase();
-      Serial.printf("Button UP -> Target set to: %d\n", targetHeight);
+      anyPressed = true;
     }
-    delay(200); // Debounce delay
   }
-
-  // DOWN Button: Decrement Target by 1
-  if (digitalRead(BTN_DOWN) == LOW) {
+  else if (digitalRead(BTN_DOWN) == LOW) {
     if (targetHeight > minHeight) {
       targetHeight--;
-      updateTargetInFirebase();
-      Serial.printf("Button DOWN -> Target set to: %d\n", targetHeight);
+      anyPressed = true;
     }
-    delay(200); // Debounce delay
   }
 
-  // STOP Button: Match target to current height immediately
   if (digitalRead(BTN_STOP) == LOW) {
     targetHeight = heightValue;
-    updateTargetInFirebase();
     stopMotor();
-    delay(200);
+    anyPressed = true;
+  }
+
+  if (anyPressed) {
+    needFirebaseSync = true;
+    lastSyncTime = millis();
+    delay(buttonRepeatDelay); 
   }
 }
+
+//================= SETUP & LOOP =================//
 
 void setup() {
   Serial.begin(115200);
   pinMode(IN1, OUTPUT); pinMode(IN2, OUTPUT);
   pinMode(BTN_UP, INPUT_PULLUP); pinMode(BTN_DOWN, INPUT_PULLUP); pinMode(BTN_STOP, INPUT_PULLUP);
   pinMode(LED_UP, OUTPUT); pinMode(LED_DOWN, OUTPUT); pinMode(LED_STOP, OUTPUT);
+  pinMode(FADE_LED, OUTPUT); 
   pinMode(wifiLed, OUTPUT);
+
+  analogWriteRange(255);
+  analogWriteFreq(1000); 
 
   WiFi.mode(WIFI_STA);
   WiFi.begin(ssid, password);
   while (WiFi.status() != WL_CONNECTED) {
-    delay(500);
+    delay(200);
     digitalWrite(wifiLed, !digitalRead(wifiLed));
   }
-  Serial.println("\nConnected!");
 
   config.database_url = FIREBASE_HOST;
   config.signer.tokens.legacy_token = FIREBASE_AUTH;
@@ -163,7 +214,10 @@ void setup() {
 
 void loop() {
   handleButtons();
-  readFirebase();
   moveTowardsTarget();
-  delay(100); 
+  updateAtmosphereLED(); 
+  updateHeightFirebase(); 
+  readFirebase();
+  syncToFirebase();
+  delay(10); 
 }
