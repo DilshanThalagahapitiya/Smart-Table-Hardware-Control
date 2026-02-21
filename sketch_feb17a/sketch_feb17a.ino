@@ -1,19 +1,22 @@
-#include <ESP8266WiFi.h>
-#include <Firebase_ESP_Client.h>
-#include <addons/TokenHelper.h>
-#include <addons/RTDBHelper.h>
+/**
+ * @file sketch_feb17a.ino
+ * @brief Optimized Smart Table Firmware - PRO GRADE
+ * Features: Non-blocking Streams, Instant Button Response, Smooth Ramping.
+ */
 
-//================= WIFI & FIREBASE =================//
+#include <ESP8266WiFi.h>
+#include "MotorControl.h"
+#include "ButtonHandler.h"
+#include "BuzzerController.h"
+#include "FirebaseManager.h"
+#include "LedEffects.h"
+
+//================= SETTINGS & PINS =================//
 const char* ssid = "SLT-Fiber-2.4G_2450"; 
 const char* password = "leaf9572";
 #define FIREBASE_HOST "smarttable-66d73-default-rtdb.firebaseio.com"
-#define FIREBASE_AUTH "YOUR_FIREBASE_DATABASE_SECRET" 
+#define FIREBASE_AUTH "B4nbM4Xs9f7NTN4JL4iI8hKMnW1iFK5UuwN8kPRy" 
 
-FirebaseData fbdo;
-FirebaseAuth auth;
-FirebaseConfig config;
-
-//================= PINS =================//
 #define BTN_UP    D5
 #define BTN_DOWN  D6
 #define BTN_STOP  D0
@@ -23,245 +26,221 @@ FirebaseConfig config;
 #define LED_DOWN  D2
 #define FADE_LED  D8  
 #define BUZZER    D7  
-const int wifiLed = LED_BUILTIN;
+// const int wifiLed = LED_BUILTIN; // Removed to avoid conflict with IN2 (D4)
 
-//================= SETTINGS =================//
-int motorStepInterval = 60;     
-int buttonRepeatDelay = 40;     
+//================= GLOBAL STATE =================//
 int heightValue = 70;
 int targetHeight = 70;
-int lastFirebaseTarget = 70; 
-const int maxHeight = 120;
-const int minHeight = 60;
+bool isMuted = false;
+bool isSync = true;   // New sync control flag
+unsigned long lastStatusPush = 0;
 
-// Buzzer Settings
-bool isMuted = false; 
-int buzzerPattern = 0; 
+//================= COMPONENT INSTANCES =================//
+MotorControl tableMotor(IN1, IN2, LED_UP, LED_DOWN, heightValue, 60, 120);
+ButtonHandler btnUp(BTN_UP);
+ButtonHandler btnDown(BTN_DOWN);
+ButtonHandler btnStop(BTN_STOP);
+BuzzerController buzzer(BUZZER);
+FirebaseManager firebase(FIREBASE_HOST, FIREBASE_AUTH);
+LedEffects statusLed(FADE_LED);
 
-String currentLedStatus = "ACTIVE"; 
-String lastLedStatus = ""; 
+//================= FIREBASE CALLBACKS =================//
+void streamCallback(FirebaseStream data) {
+    if (!isSync && data.dataPath() != "/isSync") return;
 
-bool needFirebaseSync = false;
-unsigned long lastSyncTime = 0;
-unsigned long lastMoveTime = 0; 
-unsigned long lastMotorStepTime = 0;
-
-//================= TIMER VARIABLES =================//
-unsigned long lastBlinkToggle = 0;
-bool blinkState = false;
-unsigned long lastBuzzerAction = 0;
-bool buzzerState = false;
-int doubleTapStep = 0;
-
-//================= FAST BUZZER ENGINE =================//
-
-void runBuzzerEngine() {
-  bool isMoving = (heightValue != targetHeight);
-  if (!isMoving || isMuted) {
-    digitalWrite(BUZZER, LOW);
-    doubleTapStep = 0;
-    return;
-  }
-
-  unsigned long now = millis();
-  switch (buzzerPattern) {
-    case 0: // ULTRA RAPID
-      if (now - lastBuzzerAction > 50) {
-        buzzerState = !buzzerState;
-        digitalWrite(BUZZER, buzzerState);
-        lastBuzzerAction = now;
-      }
-      break;
-    case 1: // MEDIUM
-      if (now - lastBuzzerAction > 200) {
-        buzzerState = !buzzerState;
-        digitalWrite(BUZZER, buzzerState);
-        lastBuzzerAction = now;
-      }
-      break;
-    case 2: // FAST DOUBLE TAP
-      if (doubleTapStep == 0 && now - lastBuzzerAction > 60) { digitalWrite(BUZZER, HIGH); lastBuzzerAction = now; doubleTapStep = 1; }
-      else if (doubleTapStep == 1 && now - lastBuzzerAction > 60) { digitalWrite(BUZZER, LOW); lastBuzzerAction = now; doubleTapStep = 2; }
-      else if (doubleTapStep == 2 && now - lastBuzzerAction > 60) { digitalWrite(BUZZER, HIGH); lastBuzzerAction = now; doubleTapStep = 3; }
-      else if (doubleTapStep == 3 && now - lastBuzzerAction > 60) { digitalWrite(BUZZER, LOW); lastBuzzerAction = now; doubleTapStep = 4; }
-      else if (doubleTapStep == 4 && now - lastBuzzerAction > 300) { doubleTapStep = 0; lastBuzzerAction = now; }
-      break;
-    case 3: // SOLID
-      digitalWrite(BUZZER, HIGH);
-      break;
-  }
-}
-
-//================= MOTOR FUNCTIONS =================//
-
-void stopMotor() {
-  digitalWrite(IN1, LOW);
-  digitalWrite(IN2, LOW);
-  digitalWrite(LED_UP, LOW);
-  digitalWrite(LED_DOWN, LOW);
-}
-
-void moveTowardsTarget() {
-  if (heightValue == targetHeight) {
-    stopMotor();
-    return;
-  }
-
-  bool canMoveUp = (heightValue < targetHeight && heightValue < maxHeight);
-  bool canMoveDown = (heightValue > targetHeight && heightValue > minHeight);
-
-  if (canMoveUp) {
-    digitalWrite(LED_UP, HIGH); digitalWrite(LED_DOWN, LOW);
-    if (millis() - lastMotorStepTime > (unsigned long)motorStepInterval) { 
-      digitalWrite(IN1, HIGH); digitalWrite(IN2, LOW);
-      heightValue++;
-      lastMotorStepTime = millis();
+    Serial.printf("Firebase update: %s -> %s\n", data.dataPath().c_str(), data.payload().c_str());
+    
+    if (data.dataPath() == "/isSync") {
+        isSync = data.boolData();
+        Serial.printf("Sync logic: %s\n", isSync ? "ENABLED" : "DISABLED");
+    } else if (data.dataPath() == "/targetHeight") {
+        int cloudTarget = data.intData();
+        if (cloudTarget != targetHeight) {
+            targetHeight = cloudTarget;
+            tableMotor.setTarget(targetHeight);
+            statusLed.trigger(); // Visual feedback
+            buzzer.playPattern(3); // Soft cloud beep
+        }
+    } else if (data.dataPath() == "/isMuted") {
+        isMuted = data.boolData();
+        buzzer.setMuted(isMuted);
+    } else if (data.dataPath() == "/" && data.dataType() == "json") {
+        FirebaseJson &json = data.jsonObject();
+        FirebaseJsonData jsonData;
+        if (json.get(jsonData, "targetHeight")) {
+            int cloudTarget = jsonData.intValue;
+            if (cloudTarget != targetHeight) {
+                targetHeight = cloudTarget;
+                tableMotor.setTarget(targetHeight);
+                statusLed.trigger(); // Visual feedback
+                buzzer.playPattern(3); // Soft cloud beep
+            }
+        }
+        if (json.get(jsonData, "isMuted")) {
+            isMuted = jsonData.boolValue;
+            buzzer.setMuted(isMuted);
+        }
+        if (json.get(jsonData, "isSync")) {
+            isSync = jsonData.boolValue;
+        }
     }
-  } 
-  else if (canMoveDown) {
-    digitalWrite(LED_UP, LOW); digitalWrite(LED_DOWN, HIGH);
-    if (millis() - lastMotorStepTime > (unsigned long)motorStepInterval) { 
-      digitalWrite(IN1, LOW); digitalWrite(IN2, HIGH);
-      heightValue--;
-      lastMotorStepTime = millis();
+}
+
+void streamTimeoutCallback(bool timeout) {
+    if (timeout) {
+        Serial.print("Stream timed out. Reason: ");
+        // We can't easily get the reason from inside this specific callback without the fbdo
+        // but we can signal the main loop to check health.
+        Serial.println("Network instability detected.");
     }
-  } else {
-    stopMotor();
-    targetHeight = heightValue; 
-  }
 }
-
-//================= ATMOSPHERE LED LOGIC (20s DELAY) =================//
-
-void updateAtmosphereLED() {
-  unsigned long now = millis();
-  bool isMoving = (heightValue != targetHeight);
-
-  if (isMoving) {
-    lastMoveTime = now; // Constantly reset timer while moving
-    currentLedStatus = "ACTIVE";
-    if (now - lastBlinkToggle > 100) {
-      blinkState = !blinkState;
-      analogWrite(FADE_LED, blinkState ? 1023 : 0); 
-      lastBlinkToggle = now;
-    }
-  } 
-  else if (now - lastMoveTime < 20000) { // Stay solid for 20 seconds
-    currentLedStatus = "ACTIVE";
-    analogWrite(FADE_LED, 1023); 
-  } 
-  else {
-    currentLedStatus = "DIMING STARTED"; 
-    // Dimming starts after the 20s mark
-    float phase = (now - lastMoveTime - 20000) / 1500.0;
-    int brightness = (int)(511.5 * (1.0 + sin(PI * phase - (PI / 2.0))));
-    analogWrite(FADE_LED, (brightness < 0) ? 0 : brightness);
-  }
-
-  if (currentLedStatus != lastLedStatus && Firebase.ready()) {
-    Firebase.RTDB.setString(&fbdo, "/tableControl/ledStatus", currentLedStatus);
-    lastLedStatus = currentLedStatus;
-  }
-}
-
-//================= FIREBASE SYNC =================//
-
-void readFirebase() {
-  static unsigned long lastRead = 0;
-  if (!Firebase.ready() || needFirebaseSync || (millis() - lastRead < 200)) return;
-  lastRead = millis();
-
-  if (Firebase.RTDB.getInt(&fbdo, "/tableControl/targetHeight")) {
-    int fbTarget = fbdo.intData();
-    fbTarget = constrain(fbTarget, minHeight, maxHeight);
-    if (fbTarget != lastFirebaseTarget) {
-      targetHeight = fbTarget;
-      lastFirebaseTarget = fbTarget;
-    }
-  }
-  
-  if (Firebase.RTDB.getBool(&fbdo, "/tableControl/isMuted")) {
-    isMuted = fbdo.boolData();
-  }
-
-  if (Firebase.RTDB.getInt(&fbdo, "/tableControl/buzzerPattern")) {
-    buzzerPattern = fbdo.intData();
-  }
-}
-
-void updateHeightFirebase() {
-  static unsigned long lastHeightUpdate = 0;
-  if (Firebase.ready() && (millis() - lastHeightUpdate > 800)) { 
-    Firebase.RTDB.setInt(&fbdo, "/tableControl/height", heightValue);
-    lastHeightUpdate = millis();
-  }
-}
-
-void syncToFirebase() {
-  if (needFirebaseSync && (millis() - lastSyncTime > 300)) {
-    if (Firebase.ready()) {
-      if (Firebase.RTDB.setInt(&fbdo, "/tableControl/targetHeight", targetHeight)) {
-          lastFirebaseTarget = targetHeight;
-          needFirebaseSync = false;
-      }
-    }
-  }
-}
-
-//================= BUTTONS =================//
-
-void handleButtons() {
-  bool pressed = false;
-  if (digitalRead(BTN_UP) == LOW) { 
-    if (targetHeight < maxHeight) targetHeight++; 
-    pressed = true; 
-  }
-  else if (digitalRead(BTN_DOWN) == LOW) { 
-    if (targetHeight > minHeight) targetHeight--; 
-    pressed = true; 
-  }
-  
-  if (digitalRead(BTN_STOP) == LOW) {
-    targetHeight = heightValue;
-    stopMotor();
-    pressed = true;
-  }
-
-  if (pressed) {
-    needFirebaseSync = true;
-    lastSyncTime = millis();
-    delay(buttonRepeatDelay); 
-  }
-}
-
-//================= SETUP & LOOP =================//
 
 void setup() {
-  Serial.begin(115200);
-  pinMode(IN1, OUTPUT); pinMode(IN2, OUTPUT);
-  pinMode(BTN_UP, INPUT_PULLUP); pinMode(BTN_DOWN, INPUT_PULLUP); pinMode(BTN_STOP, INPUT_PULLUP);
-  pinMode(LED_UP, OUTPUT); pinMode(LED_DOWN, OUTPUT);
-  pinMode(FADE_LED, OUTPUT); pinMode(BUZZER, OUTPUT); 
+    Serial.begin(115200);
+    delay(100);
+    Serial.println("\n\n######################################");
+    Serial.println("!!!       PRO BOARD RESTART        !!!");
+    Serial.println("######################################");
 
-  analogWriteRange(1023); 
-  analogWriteFreq(1000); 
+    tableMotor.begin();
+    btnUp.begin();
+    btnDown.begin();
+    btnStop.begin();
+    buzzer.begin();
+    statusLed.begin();
+    
+    // pinMode(wifiLed, OUTPUT); // Removed to avoid conflict
+    // digitalWrite(wifiLed, HIGH);
 
-  WiFi.begin(ssid, password);
-  while (WiFi.status() != WL_CONNECTED) { delay(100); }
+    WiFi.begin(ssid, password);
+    while (WiFi.status() != WL_CONNECTED) {
+        delay(500);
+        Serial.print(".");
+    }
+    Serial.println("\nWiFi Connected.");
+    // digitalWrite(wifiLed, LOW); // Removed to avoid conflict
 
-  config.database_url = FIREBASE_HOST;
-  config.signer.tokens.legacy_token = FIREBASE_AUTH;
-  Firebase.begin(&config, &auth);
-  Firebase.reconnectWiFi(true);
+    firebase.begin();
+    
+    // Setup stream for real-time app control (Zero lag)
+    if (!firebase.setStream("tableControl", streamCallback, streamTimeoutCallback)) {
+        Serial.println("Stream setup failed!");
+    }
+
+    // Initial Sync: Push local height to Firebase
+    firebase.setInt("tableControl/height", heightValue);
+    firebase.setString("tableControl/ledStatus", "ACTIVE");
+    Serial.println("--- SYSTEM READY ---");
 }
 
 void loop() {
-  handleButtons();
-  moveTowardsTarget();
-  runBuzzerEngine();      
-  updateAtmosphereLED(); 
-  updateHeightFirebase(); 
-  readFirebase();
-  syncToFirebase();
-  yield(); 
+    // 0. CONNECTIVITY WATCHDOG (Critical for Cloud Sync)
+    static unsigned long lastConnCheck = 0;
+    if (millis() - lastConnCheck > 5000) {
+        lastConnCheck = millis();
+        if (WiFi.status() != WL_CONNECTED) {
+            Serial.println("WiFi Lost! Attempting reconnect...");
+            WiFi.begin(ssid, password);
+        } else if (!firebase.ready()) {
+            Serial.println("Firebase not ready. Checking authentication...");
+        }
+    }
+
+    // 1. UPDATE HARDWARE (Highest Priority)
+    tableMotor.update();
+    buzzer.update();
+    statusLed.update();
+
+    // Link LED: Keep bright while moving, then 1s hold (internal to statusLed)
+    if (tableMotor.isMoving()) {
+        statusLed.trigger();
+    }
+
+    // 2. INSTANT BUTTON RESPONSE
+    int upClick = btnUp.getClickType();
+    int downClick = btnDown.getClickType();
+    int stopClick = btnStop.getClickType();
+
+    // Immediate action on Single Tap
+    if (upClick == 1) { 
+        Serial.println("BUTTON: UP Single Click");
+        targetHeight = min(120, heightValue + 1);
+        tableMotor.setTarget(targetHeight);
+        buzzer.playPattern(0); 
+        statusLed.trigger();
+    } else if (upClick == 2) { // Instant Double Tap
+        Serial.println("BUTTON: UP Double Click");
+        targetHeight = 120;
+        tableMotor.setTarget(targetHeight);
+        buzzer.playPattern(1);
+        statusLed.trigger();
+    }
+    
+    if (downClick == 1) {
+        Serial.println("BUTTON: DOWN Single Click");
+        targetHeight = max(60, heightValue - 1);
+        tableMotor.setTarget(targetHeight);
+        buzzer.playPattern(0);
+        statusLed.trigger();
+    } else if (downClick == 2) {
+        Serial.println("BUTTON: DOWN Double Click");
+        targetHeight = 60;
+        tableMotor.setTarget(targetHeight);
+        buzzer.playPattern(1);
+        statusLed.trigger();
+    }
+
+    if (stopClick > 0) {
+        tableMotor.stop();
+        targetHeight = heightValue;
+        buzzer.playPattern(2);
+        statusLed.trigger();
+    }
+
+    // 3. RESPONSIVE HOLD (No wait)
+    static unsigned long lastHoldCheck = 0;
+    if (millis() - lastHoldCheck > 100) { 
+        lastHoldCheck = millis();
+        if (btnUp.isPressed() && !tableMotor.isMoving()) {
+            tableMotor.setTarget(120);
+        } else if (btnDown.isPressed() && !tableMotor.isMoving()) {
+            tableMotor.setTarget(60);
+        }
+    }
+
+    // 4. PERIODIC TELEMETRY (Push on change/stop to reduce traffic)
+    if (isSync && firebase.ready()) {
+        static int lastPushedHeight = -1;
+        static int lastPushedTarget = -1; // Track targetHeight for cloud sync
+        static unsigned long lastPushTime = 0;
+        static bool reportedDiming = false;
+        
+        // Push targetHeight if it was changed locally
+        if (targetHeight != lastPushedTarget) {
+            lastPushedTarget = targetHeight;
+            firebase.setInt("tableControl/targetHeight", targetHeight);
+            reportedDiming = false; // Reset dimming report on new target
+            Serial.printf("Telemetry: targetHeight Sync -> %d\n", targetHeight);
+        }
+
+        if (tableMotor.isMoving()) {
+            if (millis() - lastPushTime > 500) {
+                lastPushTime = millis();
+                firebase.setInt("tableControl/height", heightValue);
+                firebase.setString("tableControl/ledStatus", "MOVING");
+                reportedDiming = false;
+            }
+        } else {
+            if (heightValue != lastPushedHeight) {
+                lastPushedHeight = heightValue;
+                firebase.setInt("tableControl/height", heightValue);
+                firebase.setString("tableControl/ledStatus", "ACTIVE");
+                reportedDiming = false;
+            } else if (statusLed.isDimming() && !reportedDiming) {
+                firebase.setString("tableControl/ledStatus", "DIMING");
+                reportedDiming = true;
+                Serial.println("Telemetry: Status updated to DIMING");
+            }
+        }
+    }
 }

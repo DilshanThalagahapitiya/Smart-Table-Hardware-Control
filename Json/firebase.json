@@ -1,0 +1,9 @@
+{
+  "tableControl": {
+    "height": 70,
+    "targetHeight": 70,
+    "isMuted": false,
+    "isSync": true,
+    "ledStatus": "ACTIVE"
+  }
+}
